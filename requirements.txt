@@ -1,4 +1,5 @@
-python-telegram-bot==21.0
+python-telegram-bot==20.7
 edge-tts==6.1.9
 deep-translator==1.11.4
-aiofiles==23.2.1
+asyncio
+
