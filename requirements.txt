@@ -1,3 +1,2 @@
-aiogram==2.25.1
-gTTS
-
+aiogram==2.23.1
+edge-tts
