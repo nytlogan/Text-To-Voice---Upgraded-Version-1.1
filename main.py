@@ -1,80 +1,175 @@
-import os
 import asyncio
+import logging
+import os
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from gtts import gTTS
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+import edge_tts
 
-bot = Bot(token=TOKEN)
+# -------------------------------------------------------------
+# BASIC CONFIGURATION
+# -------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-user_voice_choice = {}  # store male/female per user
+# -------------------------------------------------------------
+# USER PREFERENCES STORAGE (RAM-based dictionary)
+# For production you can replace with SQLite or PostgreSQL.
+# -------------------------------------------------------------
+user_preferences = {}  
+# Structure:
+# user_preferences[user_id] = {
+#     "language": "en-US",
+#     "gender": "Female",
+#     "voice": "en-US-AriaNeural"
+# }
 
+# -------------------------------------------------------------
+# SUPPORTED LANGUAGES AND VOICES (Edge TTS)
+# -------------------------------------------------------------
+voice_map = {
+    "English": {
+        "Female": "en-US-AriaNeural",
+        "Male": "en-US-GuyNeural"
+    },
+    "Bengali": {
+        "Female": "bn-BD-NabanitaNeural",
+        "Male": "bn-BD-PradeepNeural"
+    }
+}
 
-# ----------- KEYBOARDS -----------
-def main_lang_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Bangla"))
+# Map human language → language code
+language_short = {
+    "English": "en-US",
+    "Bengali": "bn-BD"
+}
+
+# -------------------------------------------------------------
+# INLINE KEYBOARDS
+# -------------------------------------------------------------
+def lang_keyboard():
+    kb = InlineKeyboardMarkup()
+    for lang in voice_map.keys():
+        kb.add(InlineKeyboardButton(text=lang, callback_data=f"set_lang|{lang}"))
     return kb
 
 def gender_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Male"), KeyboardButton("Female"))
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Male", callback_data="set_gender|Male"))
+    kb.add(InlineKeyboardButton("Female", callback_data="set_gender|Female"))
     return kb
 
-
-# ----------- START COMMAND -----------
+# -------------------------------------------------------------
+# /start COMMAND
+# -------------------------------------------------------------
 @dp.message_handler(commands=['start'])
-async def start(message: types.Message):
+async def start_handler(message: types.Message):
+    user_id = message.from_user.id
+
+    if user_id not in user_preferences:
+        user_preferences[user_id] = {"language": None, "gender": None, "voice": None}
+
     await message.answer(
-        "স্বাগতম! নীচের অপশন থেকে বেছে নিন।",
-        reply_markup=main_lang_keyboard()
+        "Welcome! 👋\n\nBefore using Text‑to‑Speech, please choose your **language**:",
+        reply_markup=lang_keyboard()
     )
 
+# -------------------------------------------------------------
+# CALLBACK HANDLER: SET LANGUAGE
+# -------------------------------------------------------------
+@dp.callback_query_handler(lambda c: c.data.startswith("set_lang"))
+async def callback_set_language(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    _, lang = callback.data.split("|")
 
-# ----------- LANGUAGE SELECT -----------
-@dp.message_handler(lambda msg: msg.text == "Bangla")
-async def choose_gender(message: types.Message):
-    await message.answer("কোন ভয়েস চান?", reply_markup=gender_keyboard())
+    user_preferences[user_id]["language"] = language_short[lang]
 
+    await callback.message.edit_text(
+        f"Language set to: {lang}\n\nNow choose **voice gender**:",
+        reply_markup=gender_keyboard()
+    )
 
-# ----------- GENDER SELECT -----------
-@dp.message_handler(lambda msg: msg.text in ["Male", "Female"])
-async def gender_selected(message: types.Message):
-    user_voice_choice[message.from_user.id] = message.text
-    await message.answer("আপনার স্ক্রিপ্ট লিখে পাঠান…")
+# -------------------------------------------------------------
+# CALLBACK HANDLER: SET GENDER
+# -------------------------------------------------------------
+@dp.callback_query_handler(lambda c: c.data.startswith("set_gender"))
+async def callback_set_gender(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    _, gender = callback.data.split("|")
 
+    user_preferences[user_id]["gender"] = gender
 
-# ----------- TEXT TO SPEECH -----------
+    # Determine voice based on saved language + gender
+    lang_full = None
+    for name, code in language_short.items():
+        if code == user_preferences[user_id]["language"]:
+            lang_full = name
+
+    selected_voice = voice_map[lang_full][gender]
+    user_preferences[user_id]["voice"] = selected_voice
+
+    await callback.message.edit_text(
+        f"✔ Gender set: {gender}\n"
+        f"✔ Voice: {selected_voice}\n\n"
+        "You're all set! 🎧\nSend me any text and I will convert it to speech."
+    )
+
+# -------------------------------------------------------------
+# TEXT MESSAGE HANDLER → TTS RESPONSE
+# -------------------------------------------------------------
 @dp.message_handler()
-async def text_to_speech(message: types.Message):
-    uid = message.from_user.id
+async def tts_handler(message: types.Message):
+    user_id = message.from_user.id
 
-    if uid not in user_voice_choice:
-        await message.answer("আগে Male/Female সিলেক্ট করুন!")
-        return
+    # Ensure preferences selected
+    if user_id not in user_preferences or user_preferences[user_id]["voice"] is None:
+        return await message.answer(
+            "You must set language and voice first.\nUse /start to begin."
+        )
 
-    text = message.text
-    gender = user_voice_choice[uid]
+    text = message.text.strip()
 
-    filename = f"voice_{uid}.mp3"
+    # Basic error handling
+    if len(text) < 2:
+        return await message.answer("Text is too short.")
+    if len(text) > 500:
+        return await message.answer("Text is too long. Max 500 characters.")
 
-    # gTTS supports only one Bangla voice — trick:
-    # Male = lower pitch (slow)
-    # Female = normal pitch (fast)
-    speed = True if gender == "Female" else False
+    voice = user_preferences[user_id]["voice"]
 
-    tts = gTTS(text=text, lang="bn", slow=speed)
-    tts.save(filename)
+    # Filename for temporary audio
+    output_file = f"tts_{user_id}.mp3"
 
-    with open(filename, "rb") as audio:
-        await message.answer_audio(audio)
+    # ---------------------------------------------------------
+    # EXECUTE EDGE TTS
+    # ---------------------------------------------------------
+    tts = edge_tts.Communicate(text, voice)
 
-    os.remove(filename)
+    try:
+        await tts.save(output_file)
+    except Exception as e:
+        return await message.answer("❌ Error generating audio.")
 
+    # ---------------------------------------------------------
+    # SEND VOICE NOTE
+    # ---------------------------------------------------------
+    with open(output_file, "rb") as audio:
+        await bot.send_voice(message.chat.id, audio)
 
-# ----------- MAIN -----------
+    # Remove temp file
+    try:
+        os.remove(output_file)
+    except:
+        pass
+
+# -------------------------------------------------------------
+# START BOT
+# -------------------------------------------------------------
 if __name__ == "__main__":
-    asyncio.run(dp.start_polling())
-    
+    executor.start_polling(dp, skip_updates=True)
+        
